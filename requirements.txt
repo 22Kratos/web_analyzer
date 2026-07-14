@@ -1,0 +1,12 @@
+httpx[http2]==0.28.1
+beautifulsoup4==4.15.0
+lxml==6.1.1
+tldextract==5.3.1
+click==8.4.2
+rich==15.0.0
+pyjwt==2.13.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+
+# might add something here later, if someone else needs to modify this, please just send me the updated list on whatsapp
+
