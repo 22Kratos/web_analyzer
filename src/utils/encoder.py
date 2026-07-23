@@ -25,6 +25,21 @@ for double url encoding:
     do I have to make a double url decoding? I dont know
 
 for Base64 Encoding/decoding:
-    
+    I will import base64
+    define a function b64():
+        convert input string to string.encode("utf-8"), this converts it to utf-8
+        encoded_bytes=base64.b64encode("utf-8 encoded bytes"). this encodes the bytes to base64
+        encoded_string=encoded_bytes.decode("utf-8"). this turns the base64 bytes to string
+
+        for decoding:
+        it will take encoded_data
+        convert it into decoded_bytes using base64.b64decode(encoded_data)
+        convert that into decoded_string using decoded_bytes.decode("utf-8")
+    Then print encoded/decoded string
+    I will most probably turn this into a nested function with a case switch condition in the end
+
+For HTML entity encoding:
+            
+
 
 """
