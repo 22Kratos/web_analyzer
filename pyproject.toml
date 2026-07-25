@@ -1,0 +1,5 @@
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# keep adding stuff as required while debugging
+# this just defines the path
