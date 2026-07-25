@@ -39,7 +39,68 @@ for Base64 Encoding/decoding:
     I will most probably turn this into a nested function with a case switch condition in the end
 
 For HTML entity encoding:
-            
+    import html
+    take text
+    encoded_text = html.escape(text)
+    print(encoded_text)
+    for html decoding, do the same thing but use html.unescape
+
+For Hex Encoding:
+    take text 
+    bytes_data = text.encode('utf-8')
+    hex_encode = bytes_data.hex()
+
+"""
+
+import base64
+import html
+import urllib.parse
 
 
+def url_encode(value: str) -> str:
+    return urllib.parse.quote(value, safe="")
+
+
+def url_decode(value: str) -> str:
+    return urllib.parse.unquote(value)
+
+
+def double_url_encode(value: str) -> str:
+    return url_encode(url_encode(value))
+
+
+def base64_encode(value: str) -> str:
+    return base64.b64encode(value.encode("utf-8")).decode("utf-8")
+
+
+def base64_decode(value: str) -> str:
+    return base64.b64decode(value.encode("utf-8")).decode("utf-8")
+
+
+def html_encode(value: str) -> str:
+    return html.escape(value)
+
+
+def html_decode(value: str) -> str:
+    return html.unescape(value)
+
+
+def hex_encode(value: str) -> str:
+    return value.encode("utf-8").hex()
+
+
+def hex_decode(value: str) -> str:
+    return bytes.fromhex(value).decode("utf-8")
+
+
+def sql_hex_encode(value: str) -> str:
+    return "0x" + hex_encode(value)
+
+
+def unicode_escape(value: str) -> str:
+    return "".join(f"\\u{ord(c):04x}" for c in value)
+
+"""
+if anyone wants to call any function from this file, just write:
+from web_analyzer.utils import encoder
 """
