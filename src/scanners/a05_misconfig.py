@@ -1,9 +1,9 @@
 import re
 
-from web_analyzer.scanners.base import Scanner, Finding, Severity
-from web_analyzer.core.models import Target, Endpoint
-from web_analyzer.core.http_client import HttpClient
-from web_analyzer.core import rate_limiter
+from ..scanners.base import Scanner, Finding, Severity
+from ..core.models import Target, Endpoint
+from ..core.http_client import HttpClient
+from ..core import rate_limiter
 
 # no idea what im doing btw
 SECURITY_HEADERS = [

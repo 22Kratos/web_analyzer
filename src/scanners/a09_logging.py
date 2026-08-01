@@ -1,316 +1,510 @@
 """
-a09_logging.py
+scanners/a09_logging.py
+------------------------
+OWASP A09:2021 - Security Logging and Monitoring Failures
 
-OWASP Top 10 (2025 draft) - A09: Security Logging Failures scanner module.
+Passive and minimal-active checks for logging/monitoring related
+weaknesses: leaked stack traces, verbose error messages, server/
+framework fingerprinting via response headers and bodies, exposed debug
+headers, verbose HTTP 500 pages, and a small, fixed list of well-known
+debug/log endpoints.
 
-Detects symptoms that usually indicate an application is NOT logging/handling
-errors safely, which is what makes A09 exploitable in practice:
+This scanner ONLY analyzes an already-populated Target object handed to
+it by the existing crawler. It:
 
-  1. Stack trace disclosure   - PHP / Java / Python tracebacks leaking to the client
-  2. Debug endpoint exposure  - /debug, /actuator, /env and common variants
-  3. Verbose error messages   - detailed internal error output on normal requests
+    - does NOT crawl, recursively discover pages, or build a sitemap
+    - does NOT parse robots.txt
+    - does NOT parse JavaScript to find URLs
+    - does NOT maintain a visited-URL set
+    - does NOT implement a spider or any HTTP infrastructure of its own
 
-Usage:
-    from a09_logging import A09LoggingScanner
+The only network activity this module performs is a short, fixed list
+of well-known path probes (see DEBUG_ENDPOINT_PATHS / LOG_PATHS below),
+issued through the project's existing, shared HttpClient - never a new
+session, never requests/aiohttp/urllib.
 
-    scanner = A09LoggingScanner(base_url="https://target.example.com")
-    report = scanner.scan()
-    print(report.to_json())
-
-CLI:
-    python3 a09_logging.py https://target.example.com
+A note on Finding.endpoint and the active-check probes:
+    core.models.Finding.endpoint is typed as Endpoint, not a URL string,
+    so every Finding this scanner produces must carry a real Endpoint
+    instance. For passive checks that's trivial - we just attach the
+    exact Endpoint object the crawler already discovered and handed us.
+    For the active probes (a fixed handful of debug/log paths the
+    crawler never visited), there is no existing Endpoint to reuse. The
+    narrowest way to satisfy the Finding schema without reintroducing
+    crawler/spider behavior is to wrap the single HTTP response the
+    probe itself just received into a minimal Endpoint - purely as a
+    reporting container for that one response, not as site discovery
+    (no links/forms extraction, no queueing, no recursion). This is a
+    judgment call reconciling two requirements that are in tension
+    (Finding needs an Endpoint; the scanner must not build Endpoints);
+    flagging it here rather than silently picking a side.
 """
 
 from __future__ import annotations
 
-import json
-import re
-import sys
-from dataclasses import dataclass, field, asdict
-from typing import List, Optional, TYPE_CHECKING
-from urllib.parse import urljoin
+from typing import Optional
 
-if TYPE_CHECKING:
-    # Only imported for type-checkers (Pyright/Pylance/mypy); never executed
-    # at runtime, so it can't cause the "not a known attribute of None" or
-    # "variable not allowed in type expression" warnings below.
-    import requests
-else:
-    try:
-        import requests
-    except ImportError:  # pragma: no cover
-        requests = None
+from ..core.models import Target, Endpoint, ResponseData, Finding, Severity
+from ..core.http_client import HttpClient
 
+# ---------------------------------------------------------------------------
+# Detection signatures
+# ---------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------- #
-# Data model
-# --------------------------------------------------------------------------- #
+STACK_TRACE_PATTERNS: list[str] = [
+    "Traceback (most recent call last)",
+    "java.lang.",
+    "Exception in thread",
+    "NullPointerException",
+    "PHP Fatal error",
+    "Warning:",
+    "Notice:",
+    "Stack trace",
+]
 
-@dataclass
-class Finding:
-    check: str                # e.g. "stack_trace_disclosure"
-    severity: str              # "info" | "low" | "medium" | "high" | "critical"
-    url: str
-    evidence: str              # short excerpt, truncated
-    detail: str = ""
-    status_code: Optional[int] = None
+VERBOSE_ERROR_PATTERNS: list[str] = [
+    "SQLSTATE",
+    "database error",
+    "Undefined variable",
+    "syntax error",
+    "Exception:",
+    "Internal Exception",
+]
 
+SERVER_INFO_HEADERS: list[str] = [
+    "Server",
+    "X-Powered-By",
+    "X-AspNet-Version",
+    "X-Runtime",
+    "X-Generator",
+]
 
-@dataclass
-class ScanReport:
-    module: str
-    target: str
-    findings: List[Finding] = field(default_factory=list)
+DEBUG_HEADERS: list[str] = [
+    "X-Debug",
+    "X-Debug-Token",
+    "X-Debug-Token-Link",
+]
 
-    def add(self, finding: Finding) -> None:
-        self.findings.append(finding)
+FRAMEWORK_DISCLOSURE_PATTERNS: list[str] = [
+    "Express",
+    "Spring Boot",
+    "Apache Tomcat",
+    "Werkzeug",
+    "Django",
+    "Flask",
+]
 
-    def to_dict(self) -> dict:
-        return {
-            "module": self.module,
-            "target": self.target,
-            "finding_count": len(self.findings),
-            "findings": [asdict(f) for f in self.findings],
-        }
-
-    def to_json(self, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent)
-
-
-# --------------------------------------------------------------------------- #
-# Signature sets
-# --------------------------------------------------------------------------- #
-
-# Stack trace signatures per-language. Kept as compiled regexes so the scanner
-# can also report *which* stack was disclosed (useful for the report body).
-STACK_TRACE_PATTERNS = {
-    "php": [
-        re.compile(r"Fatal error:.*?in\s+.+?\.php\s+on\s+line\s+\d+", re.I | re.S),
-        re.compile(r"Warning:.*?in\s+.+?\.php\s+on\s+line\s+\d+", re.I | re.S),
-        re.compile(r"Uncaught (Exception|Error):", re.I),
-        re.compile(r"Stack trace:\s*#0", re.I),
-    ],
-    "java": [
-        re.compile(r"(?:[a-zA-Z0-9_$]+\.)+[A-Za-z0-9_$]+Exception"),
-        re.compile(r"at\s+[\w$.]+\([\w.]+\.java:\d+\)"),
-        re.compile(r"Caused by:\s*[\w.$]+Exception"),
-        re.compile(r"javax\.servlet\.ServletException"),
-    ],
-    "python": [
-        re.compile(r"Traceback \(most recent call last\):"),
-        re.compile(r"File \"[^\"]+\.py\", line \d+, in \w+"),
-        re.compile(r"django\.core\.exceptions\.\w+"),
-        re.compile(r"werkzeug\.exceptions\.\w+"),
-    ],
-    "dotnet": [
-        re.compile(r"System\.[\w.]+Exception"),
-        re.compile(r"at\s+System\.[\w.]+\(.*?\)"),
-        re.compile(r"Server Error in '.*?' Application"),
-    ],
-    "nodejs": [
-        re.compile(r"at\s+[\w./\\]+:\d+:\d+"),
-        re.compile(r"\(node:\d+\)\s+\w+Error"),
-        re.compile(r"UnhandledPromiseRejectionWarning"),
-    ],
-}
-
-# Common debug / management / diagnostic endpoints across frameworks.
-DEBUG_ENDPOINTS = [
+# Small, fixed, predefined probe lists - no brute-force discovery.
+DEBUG_ENDPOINT_PATHS: list[str] = [
     "/debug",
-    "/debug/vars",
-    "/debug/pprof",
-    "/__debug__",
+    "/debug/",
     "/actuator",
-    "/actuator/health",
     "/actuator/env",
-    "/actuator/beans",
+    "/actuator/health",
     "/actuator/mappings",
-    "/actuator/heapdump",
-    "/actuator/httptrace",
     "/env",
-    "/env.php",
-    "/.env",
-    "/config/env",
-    "/phpinfo.php",
-    "/info.php",
     "/server-status",
-    "/server-info",
-    "/console",
-    "/_profiler",
-    "/elmah.axd",
+    "/phpinfo.php",
     "/trace.axd",
 ]
 
-# Phrases that indicate a verbose / overly detailed error surfaced to the user
-# instead of a generic, safely-logged message.
-VERBOSE_ERROR_PHRASES = [
-    r"SQL syntax.*?MySQL",
-    r"Warning:\s+mysqli?_",
-    r"ORA-\d{5}",
-    r"Microsoft OLE DB Provider for ODBC Drivers",
-    r"Unhandled exception",
-    r"Internal Server Error.*?(version|build|debug)",
-    r"DEBUG\s*=\s*True",
-    r"You have an error in your SQL syntax",
-    r"PostgreSQL.*?ERROR",
-    r"pg_query\(\)",
-    r"ODBC.*?Driver",
-    r"Whitelabel Error Page",  # Spring Boot default verbose error page
+LOG_PATHS: list[str] = [
+    "/logs/",
+    "/log/",
+    "/error.log",
+    "/debug.log",
+    "/access.log",
+    "/logs/debug.log",
 ]
-VERBOSE_ERROR_RE = re.compile("|".join(VERBOSE_ERROR_PHRASES), re.I | re.S)
 
-MAX_EVIDENCE_LEN = 220
+_OWASP_CATEGORY = "A09:2021-Security Logging and Monitoring Failures"
+_OWASP_REFERENCE = "https://owasp.org/Top10/A09_2021-Security_Logging_and_Monitoring_Failures/"
+
+# Explicit per-probe timeout (seconds). Must be passed on every
+# HttpClient.get() call in this module - see the compatibility note in
+# _probe_path for why leaving it unspecified would disable timeouts
+# entirely rather than falling back to HttpClient's configured default.
+_PROBE_TIMEOUT_SECONDS = 10
 
 
-def _clip(text: str, length: int = MAX_EVIDENCE_LEN) -> str:
-    text = re.sub(r"\s+", " ", text).strip()
-    return text if len(text) <= length else text[:length] + "..."
+class LoggingFailureScanner:
+    """OWASP A09 scanner: security logging & monitoring failures."""
 
+    def __init__(self, http_client: HttpClient):
+        """
+        Args:
+            http_client: The project's shared, already-configured
+                HttpClient instance. This scanner never creates its own
+                HTTP session - every active probe below reuses this one,
+                and only when a fixed-path active check is being run.
+        """
+        self._http_client = http_client
 
-# --------------------------------------------------------------------------- #
-# Scanner
-# --------------------------------------------------------------------------- #
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-class A09LoggingScanner:
-    """
-    Scans a target for symptoms of A09: Security Logging Failures.
+    async def scan(self, target: Target) -> list[Finding]:
+        """
+        Analyze every Endpoint already discovered on ``target`` (passive
+        checks), then probe a small fixed set of well-known debug/log
+        paths against ``target.base_url`` (active checks).
 
-    Note: this module tests for OBSERVABLE SYMPTOMS from the outside
-    (stack traces, debug endpoints, verbose errors). It cannot verify that
-    logging/alerting is actually happening server-side — that requires log
-    access. It's a black-box proxy signal: apps that leak this much detail to
-    clients are very unlikely to be logging/alerting correctly either.
-    """
+        Returns:
+            Every Finding produced by either phase.
+        """
+        findings: list[Finding] = []
 
-    MODULE_NAME = "A09-security-logging-failures"
+        for endpoint in target.endpoints:
+            findings.extend(self._run_passive_checks(endpoint))
 
-    def __init__(
-        self,
-        base_url: str,
-        session: Optional[requests.Session] = None,
-        timeout: float = 10.0,
-        verify_tls: bool = True,
-        user_agent: str = "A09-Scanner/1.0",
-    ):
-        if requests is None:
-            raise RuntimeError("The 'requests' package is required: pip install requests")
-        self.base_url = base_url.rstrip("/")
-        self.session = session or requests.Session()
-        self.session.headers.setdefault("User-Agent", user_agent)
-        self.timeout = timeout
-        self.verify_tls = verify_tls
+        findings.extend(await self._run_active_checks(target))
 
-    # -- internal helpers --------------------------------------------------- #
+        return findings
 
-    def _get(self, path: str):
-        url = urljoin(self.base_url + "/", path.lstrip("/"))
+    # ------------------------------------------------------------------
+    # Passive checks - inspect data the crawler already collected
+    # ------------------------------------------------------------------
+
+    def _run_passive_checks(self, endpoint: Endpoint) -> list[Finding]:
+        findings: list[Finding] = []
+        findings.extend(self._check_stack_traces(endpoint))
+        findings.extend(self._check_verbose_errors(endpoint))
+        findings.extend(self._check_server_info_leakage(endpoint))
+        findings.extend(self._check_debug_headers(endpoint))
+        findings.extend(self._check_framework_disclosure(endpoint))
+        findings.extend(self._check_verbose_500(endpoint))
+        return findings
+
+    def _check_stack_traces(self, endpoint: Endpoint) -> list[Finding]:
+        body = endpoint.response.body
+        match = self._find_match(body, STACK_TRACE_PATTERNS)
+        if not match:
+            return []
+
+        return [Finding(
+            title="Stack Trace Disclosure",
+            severity=Severity.MEDIUM,
+            endpoint=endpoint,
+            description=(
+                "The response body contains what appears to be a raw "
+                "application stack trace, which can reveal internal "
+                "file paths, class names, and framework internals to "
+                "an attacker."
+            ),
+            remediation=[
+                "Disable debug/verbose error output in production.",
+                "Return generic error pages to clients.",
+                "Log full stack traces server-side only, never in the HTTP response.",
+            ],
+            evidence={"pattern": match, "snippet": self._snippet(body, match)},
+            references=[_OWASP_REFERENCE, "https://cwe.mitre.org/data/definitions/209.html"],
+            owasp=_OWASP_CATEGORY,
+            cvss_score=5.3,
+        )]
+
+    def _check_verbose_errors(self, endpoint: Endpoint) -> list[Finding]:
+        body = endpoint.response.body
+        match = self._find_match(body, VERBOSE_ERROR_PATTERNS)
+        if not match:
+            return []
+
+        return [Finding(
+            title="Verbose Error Message Disclosure",
+            severity=Severity.MEDIUM,
+            endpoint=endpoint,
+            description=(
+                "The response body contains a verbose, application- or "
+                "database-level error message. Such messages often leak "
+                "query structure, table/column names, or internal logic "
+                "that helps an attacker refine further attacks."
+            ),
+            remediation=[
+                "Catch exceptions server-side and return a generic error message to the client.",
+                "Log the verbose details internally instead of rendering them in the response.",
+            ],
+            evidence={"pattern": match, "snippet": self._snippet(body, match)},
+            references=[_OWASP_REFERENCE, "https://cwe.mitre.org/data/definitions/209.html"],
+            owasp=_OWASP_CATEGORY,
+            cvss_score=5.3,
+        )]
+
+    def _check_server_info_leakage(self, endpoint: Endpoint) -> list[Finding]:
+        headers = endpoint.response.headers
+        leaked = {
+            name: self._header_value(headers, name)
+            for name in SERVER_INFO_HEADERS
+            if self._header_present(headers, name)
+        }
+        if not leaked:
+            return []
+
+        return [Finding(
+            title="Server/Technology Information Disclosure",
+            severity=Severity.LOW,
+            endpoint=endpoint,
+            description=(
+                "The response includes headers that disclose server "
+                "software, framework, or runtime details, which can help "
+                "an attacker fingerprint the stack and target known "
+                "vulnerabilities for that specific technology."
+            ),
+            remediation=[
+                "Remove or mask identifying headers (Server, X-Powered-By, "
+                "X-AspNet-Version, X-Runtime, X-Generator) at the web "
+                "server or reverse proxy layer.",
+            ],
+            evidence={"leaked_headers": leaked},
+            references=[_OWASP_REFERENCE, "https://cwe.mitre.org/data/definitions/200.html"],
+            owasp=_OWASP_CATEGORY,
+            cvss_score=3.1,
+        )]
+
+    def _check_debug_headers(self, endpoint: Endpoint) -> list[Finding]:
+        headers = endpoint.response.headers
+        leaked = {
+            name: self._header_value(headers, name)
+            for name in DEBUG_HEADERS
+            if self._header_present(headers, name)
+        }
+        if not leaked:
+            return []
+
+        return [Finding(
+            title="Debug Header Exposed",
+            severity=Severity.HIGH,
+            endpoint=endpoint,
+            description=(
+                "The response includes one or more debug headers (e.g. "
+                "X-Debug-Token) typically emitted by a framework's debug "
+                "toolbar. These headers can expose or link to a debug "
+                "profiler that reveals request internals, environment "
+                "data, and sometimes credentials."
+            ),
+            remediation=[
+                "Disable debug/profiler tooling in production environments.",
+                "Ensure no X-Debug-* headers are ever emitted outside of local development.",
+            ],
+            evidence={"leaked_headers": leaked},
+            references=[_OWASP_REFERENCE, "https://cwe.mitre.org/data/definitions/489.html"],
+            owasp=_OWASP_CATEGORY,
+            cvss_score=7.5,
+        )]
+
+    def _check_framework_disclosure(self, endpoint: Endpoint) -> list[Finding]:
+        headers = endpoint.response.headers
+        body = endpoint.response.body
+        haystack = " ".join(headers.values()) + " " + body
+
+        match = self._find_match(haystack, FRAMEWORK_DISCLOSURE_PATTERNS)
+        if not match:
+            return []
+
+        return [Finding(
+            title="Framework/Version Disclosure",
+            severity=Severity.LOW,
+            endpoint=endpoint,
+            description=(
+                "The response reveals the underlying web framework "
+                "(and potentially its version), which can help an "
+                "attacker target known, framework-specific "
+                "vulnerabilities."
+            ),
+            remediation=[
+                "Suppress framework identification banners/headers.",
+                "Avoid rendering default framework error or debug pages in production.",
+            ],
+            evidence={"pattern": match, "snippet": self._snippet(haystack, match)},
+            references=[_OWASP_REFERENCE],
+            owasp=_OWASP_CATEGORY,
+            cvss_score=3.1,
+        )]
+
+    def _check_verbose_500(self, endpoint: Endpoint) -> list[Finding]:
+        if endpoint.response.status_code != 500:
+            return []
+
+        body = endpoint.response.body
+        # A bare HTTP 500 with a generic body isn't itself a finding -
+        # only flag it when the body also trips one of the detail-
+        # leaking signals already defined above.
+        match = self._find_match(body, STACK_TRACE_PATTERNS + VERBOSE_ERROR_PATTERNS)
+        if not match:
+            return []
+
+        return [Finding(
+            title="Verbose HTTP 500 Error Page",
+            severity=Severity.MEDIUM,
+            endpoint=endpoint,
+            description=(
+                "The server returned an HTTP 500 response whose body "
+                "contains detailed internal error information rather "
+                "than a generic error page."
+            ),
+            remediation=[
+                "Configure the application/web server to return a generic 500 error page in production.",
+                "Log the detailed error server-side only.",
+            ],
+            evidence={"pattern": match, "snippet": self._snippet(body, match), "status_code": 500},
+            references=[_OWASP_REFERENCE],
+            owasp=_OWASP_CATEGORY,
+            cvss_score=5.3,
+        )]
+
+    # ------------------------------------------------------------------
+    # Active checks - a small, fixed list of well-known path probes
+    # ------------------------------------------------------------------
+
+    async def _run_active_checks(self, target: Target) -> list[Finding]:
+        findings: list[Finding] = []
+
+        for path in DEBUG_ENDPOINT_PATHS:
+            finding = await self._probe_path(target.base_url, path, kind="debug")
+            if finding:
+                findings.append(finding)
+
+        for path in LOG_PATHS:
+            finding = await self._probe_path(target.base_url, path, kind="log")
+            if finding:
+                findings.append(finding)
+
+        return findings
+
+    async def _probe_path(self, base_url: str, path: str, kind: str) -> Optional[Finding]:
+        """
+        Probe a single fixed, well-known path via the existing HttpClient.
+
+        Returns a Finding only if the path responds with HTTP 200 (i.e.
+        appears to actually exist and be publicly accessible). Any
+        transport-level failure (timeout, connection error, DNS failure)
+        is treated as "not present" and silently skipped - this is a
+        small fixed probe list, not a discovery crawl, so failures are
+        not exceptional.
+        """
+        url = self._join_url(base_url, path)
+
         try:
-            return url, self.session.get(
-                url, timeout=self.timeout, verify=self.verify_tls, allow_redirects=True
+            # NOTE - compatibility fix: core.http_client.HttpClient.get()
+            # defaults timeout/follow_redirects to None and forwards them
+            # to httpx unconditionally. httpx treats an explicit
+            # timeout=None as "no timeout" (not "use the client's
+            # configured default"), and an explicit follow_redirects=None
+            # as falsy (not "use the client's configured default" either -
+            # the AsyncClient was constructed with follow_redirects=True,
+            # but that only applies when the per-call kwarg is left as
+            # httpx's own sentinel, which this wrapper never passes
+            # through). Left unspecified, every probe here would (a) be
+            # able to hang forever on an unresponsive path, and (b) fail
+            # to follow a redirect a probed path might legitimately issue
+            # (e.g. /env -> /env/), producing a false negative. Both are
+            # avoided by always passing explicit values on every call.
+            response = await self._http_client.get(
+                url,
+                timeout=_PROBE_TIMEOUT_SECONDS,
+                follow_redirects=True,
             )
-        except requests.RequestException as exc:
-            return url, exc
+        except Exception:
+            return None
 
-    def _check_stack_traces(self, url: str, body: str, report: ScanReport) -> None:
-        for lang, patterns in STACK_TRACE_PATTERNS.items():
-            for pattern in patterns:
-                match = pattern.search(body)
-                if match:
-                    report.add(Finding(
-                        check="stack_trace_disclosure",
-                        severity="high",
-                        url=url,
-                        evidence=_clip(match.group(0)),
-                        detail=f"{lang.upper()} stack trace / error detail exposed to client",
-                    ))
-                    break  # one hit per language is enough
+        status_code = getattr(response, "status_code", 0) or 0
+        if status_code != 200:
+            return None
 
-    def _check_verbose_errors(self, url: str, body: str, status_code: int, report: ScanReport) -> None:
-        match = VERBOSE_ERROR_RE.search(body)
-        if match:
-            report.add(Finding(
-                check="verbose_error_message",
-                severity="medium",
-                url=url,
-                evidence=_clip(match.group(0)),
-                detail="Response contains detailed internal error/debug information",
+        try:
+            body = response.text
+        except Exception:
+            # httpx.Response.text can raise on an undecodable body (e.g.
+            # a genuinely binary log/access file); treat that the same
+            # as "nothing readable to report" rather than aborting the
+            # whole active-check phase.
+            body = ""
+
+        headers = dict(getattr(response, "headers", {}) or {})
+        content_type = self._header_value(headers, "Content-Type")
+
+        # See module docstring: this Endpoint exists solely to carry the
+        # one response this probe just received, so Finding.endpoint has
+        # something valid to point at - it is not a discovered/crawled
+        # page and nothing downstream should treat it as one.
+        probed_endpoint = Endpoint(
+            url=url,
+            method="GET",
+            response=ResponseData(
                 status_code=status_code,
-            ))
+                content_type=content_type,
+                headers=headers,
+                body=body,
+            ),
+        )
 
-    def _check_debug_endpoints(self, report: ScanReport) -> None:
-        for path in DEBUG_ENDPOINTS:
-            url, resp = self._get(path)
-            if isinstance(resp, Exception):
-                continue
-            if resp.status_code < 400 or resp.status_code in (401, 403):
-                # 2xx/3xx = accessible; 401/403 still confirms the endpoint exists
-                severity = "high" if resp.status_code < 400 else "low"
-                report.add(Finding(
-                    check="debug_endpoint_exposed",
-                    severity=severity,
-                    url=url,
-                    evidence=f"HTTP {resp.status_code}",
-                    detail="Debug/management endpoint reachable" if resp.status_code < 400
-                            else "Debug/management endpoint exists but access-restricted",
-                    status_code=resp.status_code,
-                ))
+        if kind == "debug":
+            title = f"Exposed Debug Endpoint: {path}"
+            description = (
+                f"A debug/management endpoint at {path} responded with "
+                "HTTP 200 and appears to be publicly accessible. Debug "
+                "and actuator-style endpoints frequently expose "
+                "environment variables, configuration, internal routes, "
+                "or health/diagnostic internals."
+            )
+        else:
+            title = f"Exposed Log File/Directory: {path}"
+            description = (
+                f"A log file or log directory at {path} responded with "
+                "HTTP 200 and appears to be publicly accessible. Exposed "
+                "logs can leak stack traces, credentials, session "
+                "tokens, or other sensitive runtime data."
+            )
 
-    def _probe_error_inducing_requests(self, report: ScanReport):
-        """
-        Send a handful of harmless-but-malformed requests designed to trip
-        error handlers (not to exploit anything) so verbose-error / stack
-        trace detectors above have something to inspect beyond the homepage.
-        """
-        probes = [
-            ("/?id=1'", "single-quote in query param"),
-            ("/?page=../../../../etc/passwd", "path traversal-shaped param"),
-            ("/nonexistent-" + "a" * 40, "long unknown path"),
-            ("/%00", "null byte in path"),
-        ]
-        for path, _label in probes:
-            url, resp = self._get(path)
-            if isinstance(resp, Exception):
-                continue
-            body = resp.text or ""
-            self._check_stack_traces(url, body, report)
-            self._check_verbose_errors(url, body, resp.status_code, report)
+        return Finding(
+            title=title,
+            severity=Severity.HIGH,
+            endpoint=probed_endpoint,
+            description=description,
+            remediation=[
+                "Restrict or remove public access to debug/management endpoints and log files/directories.",
+                "Require authentication or bind them to an internal network only.",
+                "Disable them entirely in production where not needed.",
+            ],
+            evidence={"status_code": status_code, "snippet": body[:200].strip()},
+            references=[_OWASP_REFERENCE, "https://cwe.mitre.org/data/definitions/200.html"],
+            owasp=_OWASP_CATEGORY,
+            cvss_score=7.5,
+        )
 
-    # -- public API ----------------------------------------------------------- #
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
 
-    def scan(self) -> ScanReport:
-        report = ScanReport(module=self.MODULE_NAME, target=self.base_url)
+    @staticmethod
+    def _join_url(base_url: str, path: str) -> str:
+        return base_url.rstrip("/") + "/" + path.lstrip("/")
 
-        # 1. Baseline homepage check
-        url, resp = self._get("/")
-        if not isinstance(resp, Exception):
-            self._check_stack_traces(url, resp.text or "", report)
-            self._check_verbose_errors(url, resp.text or "", resp.status_code, report)
+    @staticmethod
+    def _find_match(text: str, patterns: list[str]) -> Optional[str]:
+        """Return the first pattern found in ``text`` (case-insensitive), or None."""
+        lowered = text.lower()
+        for pattern in patterns:
+            if pattern.lower() in lowered:
+                return pattern
+        return None
 
-        # 2. Debug / actuator / env endpoints
-        self._check_debug_endpoints(report)
+    @staticmethod
+    def _header_present(headers: dict[str, str], name: str) -> bool:
+        return any(key.lower() == name.lower() for key in headers)
 
-        # 3. Lightweight error-inducing probes to surface hidden stack traces
-        self._probe_error_inducing_requests(report)
+    @staticmethod
+    def _header_value(headers: dict[str, str], name: str) -> str:
+        for key, value in headers.items():
+            if key.lower() == name.lower():
+                return value
+        return ""
 
-        return report
-
-
-# --------------------------------------------------------------------------- #
-# CLI entry point
-# --------------------------------------------------------------------------- #
-
-def main(argv: Optional[List[str]] = None) -> int:
-    argv = argv if argv is not None else sys.argv[1:]
-    if not argv:
-        print("Usage: python3 a09_logging.py <base_url>", file=sys.stderr)
-        return 1
-
-    target = argv[0]
-    scanner = A09LoggingScanner(base_url=target)
-    report = scanner.scan()
-    print(report.to_json())
-    return 0 if not report.findings else 2
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    @staticmethod
+    def _snippet(body: str, match: str, context: int = 40) -> str:
+        """Return a short excerpt of ``body`` centered on ``match`` as evidence."""
+        idx = body.lower().find(match.lower())
+        if idx == -1:
+            return match
+        start = max(0, idx - context)
+        end = min(len(body), idx + len(match) + context)
+        return body[start:end].strip()

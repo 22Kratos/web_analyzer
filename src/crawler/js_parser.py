@@ -8,7 +8,7 @@ and inline <script> blocks) so they can be added to the crawl queue and
 handed off to scanners.
 
 Conforms to the shared interface contract:
-    Deliverable -> List[DiscoveredEndpoint]
+    Deliverable -> List[Endpoint]
 
 Detection strategies (regex-based, no JS execution required):
     1. fetch("url", { method: "..." })
@@ -23,38 +23,30 @@ Detection strategies (regex-based, no JS execution required):
 
 All matches are normalized against the page's base URL, deduplicated,
 and filtered to drop obvious static-asset noise (images, fonts, css...).
+
+Endpoint is the single canonical model, owned by core.models - it is
+imported here, never redefined. JSParser only ever sees raw JS source
+text, never an actual HTTP response, so it can only honestly populate
+url / method / request.params on the Endpoint it builds; every
+response.* field and request.headers / request.cookies are left at
+their model defaults for Spider to fill in once it actually performs
+the request (see architecture rule 6 - Spider builds the canonical,
+fully-populated Endpoint after crawling; this module only supplies the
+part it can know from static analysis).
+
+JSParser MUST NOT:
+    - Download JavaScript      -> spider.py fetches, this module only parses
+    - Execute JavaScript        -> purely regex/static analysis
+    - Perform HTTP requests     -> no network I/O anywhere in this module
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse, parse_qsl
 
-# ---------------------------------------------------------------------------
-# Shared data contract
-# ---------------------------------------------------------------------------
-try:
-    from ..core.models import DiscoveredEndpoint, Param  # type: ignore
-except ImportError:  # pragma: no cover - standalone/testing fallback
-    @dataclass
-    class Param:
-        name: str
-        value: Optional[str] = None
-        source: str = "js"  # where it was found: js, query, body, etc.
-
-    @dataclass
-    class DiscoveredEndpoint:
-        url: str
-        method: str = "GET"
-        params: List[Param] = field(default_factory=list)
-        forms: List[dict] = field(default_factory=list)
-        headers: dict = field(default_factory=dict)
-        status_code: int = 0
-        content_type: str = ""
-        links: List[str] = field(default_factory=list)
-        is_form: bool = False
+from dataclasses import dataclass
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +79,19 @@ HTTP_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS")
 _STR = r"""["'`]((?:[^"'`])*?)["'`]"""
 
 
+@dataclass
+class JSDiscovery:
+    """
+    Represents an endpoint discovered inside JavaScript.
+
+    This contains only discovery information.
+    Spider is responsible for constructing the canonical Endpoint.
+    """
+
+    url: str
+    method: str
+    params: Dict[str, str]
+
 class JSParser:
     """Extracts candidate API endpoints from a blob of JavaScript source."""
 
@@ -108,35 +113,39 @@ class JSParser:
     # Public API
     # ------------------------------------------------------------------
 
-    def extract(self, js_content: str) -> List[DiscoveredEndpoint]:
-        """Parse js_content and return deduplicated DiscoveredEndpoint list."""
-        found: dict[tuple[str, str], DiscoveredEndpoint] = {}
-        seen_urls: set[str] = set()
+    def extract(self, js_content: str) -> List[JSDiscovery]:
+        """Parse js_content and return deduplicated JSDiscovery list.
+
+        Deduplication here is strictly local to this single blob of JS -
+        global, cross-document deduplication is CrawlQueue's job alone.
+        """
+        found: Dict[tuple, JSDiscovery] = {}
+        seen_urls: set = set()
 
         # Pass 1: structured call sites (fetch/axios/$.ajax/xhr/websocket) -
         # these carry a reliable method, so they take priority.
         for method, url in self._find_structured_calls(js_content):
-            endpoint = self._to_endpoint(url, method)
-            if endpoint is None:
+            discovery = self._to_discovery(url, method)
+            if discovery is None:
                 continue
-            found[(endpoint.method, endpoint.url)] = endpoint
-            seen_urls.add(endpoint.url)
+            found[(discovery.method, discovery.url)] = discovery
+            seen_urls.add(discovery.url)
 
         # Pass 2: bare string-literal fallback - skip anything already
         # captured above so we don't add a redundant "GET" duplicate for a
         # URL that was already seen with e.g. POST.
         for method, url in self._find_fallback_strings(js_content):
-            endpoint = self._to_endpoint(url, method)
-            if endpoint is None or endpoint.url in seen_urls:
+            discovery = self._to_discovery(url, method)
+            if discovery is None or discovery.url in seen_urls:
                 continue
-            key = (endpoint.method, endpoint.url)
+            key = (discovery.method, discovery.url)
             if key not in found:
-                found[key] = endpoint
-                seen_urls.add(endpoint.url)
+                found[key] = discovery
+                seen_urls.add(discovery.url)
 
         return list(found.values())
 
-    def extract_from_files(self, js_blobs: dict) -> List[DiscoveredEndpoint]:
+    def extract_from_files(self, js_blobs: Dict[str, str]) -> List[JSDiscovery]:
         """
         Convenience helper for spider.py: parse multiple JS sources at once.
 
@@ -145,7 +154,7 @@ class JSParser:
                 external .js file plus each inline <script> block found by
                 html_parser.py on a page.
         """
-        all_results: dict[tuple[str, str], DiscoveredEndpoint] = {}
+        all_results: Dict[tuple, JSDiscovery] = {}
         for source_url, content in js_blobs.items():
             parser = JSParser(base_url=source_url or self.base_url,
                                include_static_assets=self.include_static_assets)
@@ -243,7 +252,16 @@ class JSParser:
             return True
         return False
 
-    def _to_endpoint(self, url: str, method: str) -> Optional[DiscoveredEndpoint]:
+    def _to_discovery(self, url: str, method: str) -> Optional[JSDiscovery]:
+        """
+        Build a canonical JSDiscovery from a discovered (method, url) pair.
+
+        Only url / method / request.params are populated here - this
+        module has no HTTP response to draw the rest from. Spider is
+        responsible for overwriting/enriching response.* and
+        request.headers / request.cookies once it actually performs the
+        request (architecture rule 6).
+        """
         if not self.include_static_assets and url.lower().split("?")[0].endswith(STATIC_ASSET_EXT):
             return None
 
@@ -253,14 +271,13 @@ class JSParser:
         if parsed.scheme not in ("http", "https", "ws", "wss"):
             return None
 
-        params = [
-            Param(name=name, value=value, source="js")
-            for name, value in parse_qsl(parsed.query)
-        ]
+        params = dict(parse_qsl(parsed.query))
 
-        return DiscoveredEndpoint(
-            url=resolved,
-            method=method.upper() if method.upper() in HTTP_METHODS else "GET",
-            params=params,
-        )
+        return JSDiscovery(
+        url=resolved,
+        method=method.upper() if method.upper() in HTTP_METHODS else "GET",
+        params=params,
+    )
 
+
+    # endpoint = self._to_endpoint(url, method)
