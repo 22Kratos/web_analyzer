@@ -1,296 +1,297 @@
 """
-a10_exceptions.py
+scanners/a10_exceptions.py
+---------------------------
+OWASP Top 10 (2025 draft) - A10: Mishandling of Exceptions
 
-OWASP Top 10 (2025 draft) - A10: Mishandling of Exceptions scanner module.
+Detects symptoms of exceptions being caught/surfaced incorrectly rather
+than being handled safely and generically:
 
-Detects symptoms of exceptions being caught/surfaced incorrectly rather than
-being handled safely and generically:
+  1. NULL-reference hints     - "NULL pointer", "null value", NPE-style
+                                 leaks across languages/runtimes
+  2. Sensitive info in errors - file system paths, DB connection
+                                 details, and stack traces bleeding
+                                 sensitive detail into responses
 
-  1. NULL-reference hints     - "NULL pointer", "null value", NPE-style leaks
-  2. Sensitive info in errors - file system paths, DB connection details,
-                                 stack traces bleeding into responses
+This is a companion module to a09_logging.py (A09: Security Logging
+Failures) - the two categories overlap heavily in symptoms but focus on
+different root causes: A09 is about *failing to log/alert safely and
+suppress general verbosity*, A10 is about *failing to catch/handle
+exceptions safely*, so this module specifically concentrates on
+null-handling bugs and sensitive-data leakage patterns rather than
+generic error verbosity or debug endpoints (those stay in a09).
 
-This is a companion module to a09_logging.py (A09: Security Logging Failures) —
-the two OWASP categories overlap heavily in symptoms but focus on different
-root causes: A09 is about *failing to log/alert safely*, A10 is about
-*failing to catch/handle exceptions safely*, so this module specifically
-concentrates on NULL-handling bugs and sensitive-data leakage patterns rather
-than generic verbosity or debug endpoints.
+This scanner ONLY analyzes an already-populated Target object handed to
+it by the existing crawler. It:
 
-Usage:
-    from a10_exceptions import A10ExceptionScanner
+    - does NOT crawl, recursively discover pages, or build a sitemap
+    - does NOT perform any active HTTP probing - this module is purely
+      passive, so it needs no HttpClient at all
+    - does NOT maintain a visited-URL set
+    - does NOT build Endpoint or Target objects - every Finding attaches
+      the exact Endpoint object the crawler already discovered and
+      handed us via target.endpoints
 
-    scanner = A10ExceptionScanner(base_url="https://target.example.com")
-    report = scanner.scan()
-    print(report.to_json())
+A note on the "owasp" field / references:
+    "A10: Mishandling of Exceptions" is not a category with a confirmed,
+    published owasp.org page as of this module's writing - unlike A09's
+    real 2021 OWASP Top 10 entry, this appears to be a project-specific
+    or draft category name. Rather than fabricate an owasp.org URL,
+    references below point at the relevant CWE entries (CWE-388 Error
+    Handling, CWE-209/CWE-215 information exposure through error
+    messages/debug info). Swap in an internal doc link if this project
+    has one for its own A10 definition.
 
-CLI:
-    python3 a10_exceptions.py https://target.example.com
+    exception
 """
 
 from __future__ import annotations
 
-import json
 import re
-import sys
-from dataclasses import dataclass, field, asdict
-from typing import List, Optional, TYPE_CHECKING
-from urllib.parse import urljoin
+from typing import Optional
 
-if TYPE_CHECKING:
-    # Only imported for type-checkers (Pyright/Pylance/mypy); never executed
-    # at runtime, so it can't cause the "not a known attribute of None" or
-    # "variable not allowed in type expression" warnings below.
-    import requests
-else:
-    try:
-        import requests
-    except ImportError:  # pragma: no cover
-        requests = None
+from ..core.models import Target, Endpoint, Finding, Severity
 
+# ---------------------------------------------------------------------------
+# Detection signatures
+# ---------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------- #
-# Data model
-# --------------------------------------------------------------------------- #
-
-@dataclass
-class Finding:
-    check: str
-    severity: str
-    url: str
-    evidence: str
-    detail: str = ""
-    status_code: Optional[int] = None
-
-
-@dataclass
-class ScanReport:
-    module: str
-    target: str
-    findings: List[Finding] = field(default_factory=list)
-
-    def add(self, finding: Finding) -> None:
-        self.findings.append(finding)
-
-    def to_dict(self) -> dict:
-        return {
-            "module": self.module,
-            "target": self.target,
-            "finding_count": len(self.findings),
-            "findings": [asdict(f) for f in self.findings],
-        }
-
-    def to_json(self, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent)
-
-
-# --------------------------------------------------------------------------- #
-# Signature sets
-# --------------------------------------------------------------------------- #
-
-# NULL-reference / uninitialized-value error hints across languages.
-NULL_HINT_PATTERNS = [
-    re.compile(r"NULL pointer", re.I),
-    re.compile(r"null value", re.I),
-    re.compile(r"NullPointerException"),
-    re.compile(r"NullReferenceException"),
-    re.compile(r"Object reference not set to an instance of an object"),
-    re.compile(r"Cannot read propert(?:y|ies) of (?:null|undefined)"),
-    re.compile(r"Cannot read propert(?:y|ies) of undefined"),
-    re.compile(r"TypeError:\s+.*?(?:is|of)\s+(?:null|None|undefined)", re.I),
-    re.compile(r"AttributeError:\s+'NoneType'\s+object has no attribute"),
-    re.compile(r"undefined index", re.I),
-    re.compile(r"undefined variable", re.I),
-    re.compile(r"undefined offset", re.I),
-    re.compile(r"nil pointer dereference", re.I),
-    re.compile(r"unwrap\(\)\s+on\s+a\s+None\s+value"),  # Rust
+# 1. NULL-reference hints - deliberately broader/more specific than a09's
+# generic STACK_TRACE_PATTERNS "NullPointerException" entry: these cover
+# the null/undefined-reference family across several languages/runtimes.
+NULL_REFERENCE_PATTERNS: list[str] = [
+    "NullPointerException",
+    "NULL pointer",
+    "null value",
+    "Object reference not set to an instance of an object",
+    "Cannot read property",
+    "Cannot read properties of null",
+    "Cannot read properties of undefined",
+    "undefined is not an object",
+    "NoneType' object has no attribute",
+    "AttributeError: 'NoneType'",
+    "TypeError: Cannot read",
 ]
 
-# Sensitive information disclosed via error output.
-FILE_PATH_PATTERNS = [
-    re.compile(r"[A-Za-z]:\\(?:[\w.\- ]+\\)+[\w.\-]+"),          # Windows paths e.g. C:\inetpub\...
-    re.compile(r"/(?:var|home|etc|usr|opt|srv)/(?:[\w.\-]+/)+[\w.\-]+"),  # *nix paths
-    re.compile(r"/var/www/[\w./\-]+"),
-    re.compile(r"in\s+/[\w./\-]+\.(?:php|py|rb|js|java)\s+on\s+line\s+\d+", re.I),
+# 2a. Database connection detail patterns - connection strings, driver
+# URIs, and credential-bearing connection parameters that should never
+# appear in a client-facing error response.
+DB_CONNECTION_PATTERNS: list[str] = [
+    "jdbc:",
+    "mongodb://",
+    "mongodb+srv://",
+    "postgres://",
+    "postgresql://",
+    "mysql://",
+    "oracle:",
+    "sqlite:",
+    "Initial Catalog=",
+    "User Id=",
+    "Password=",
+    "ConnectionString",
+
+    # Common connection string keys
+    "Data Source=",
+    "Initial Catalog=",
+    "Database=",
+    "Server=",
+    "Host=",
+    "Port=",
+
+    # Credentials
+    "User Id=",
+    "UserID=",
+    "UID=",
+    "Username=",
+    "Password=",
+    "Pwd=",
+    "pwd=",
+
+    # Generic connection string indicators
+    "ConnectionString",
+    "connection string",
 ]
 
-DB_INFO_PATTERNS = [
-    re.compile(r"jdbc:[\w:]+://[\w.\-:@/]+"),
-    re.compile(r"(?:mysql|postgres(?:ql)?|mongodb|mssql|oracle)://[^\s\"']+", re.I),
-    re.compile(r"SQLSTATE\[\w+\]"),
-    re.compile(r"ORA-\d{5}"),
-    re.compile(r"pg_(?:query|connect|exec)\(\)"),
-    re.compile(r"Access denied for user '.*?'@'.*?'"),
-    re.compile(r"Unknown database '.*?'"),
-    re.compile(r"could not connect to server"),
-    re.compile(r"Login failed for user '.*?'"),
-    re.compile(r"ConnectionString", re.I),
-]
+# 2b. File system path patterns - absolute Windows and Unix-style paths
+# that reveal server-side directory layout when they leak into an error
+# body (e.g. a Python "File "/app/src/handlers.py", line 42" traceback
+# line, or a raw filesystem path embedded in a .NET/Java exception).
+_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:\\(?:[^\\\r\n\"'<>|]+\\)*[^\\\r\n\"'<>|]+")
+_UNIX_PATH_RE = re.compile(r"/(?:etc|var|usr|home|opt|root|tmp|data|workspace|srv|app)/[^\s\"'<>]+")
+_PYTHON_TRACEBACK_FILE_RE = re.compile(r'File "([^"]+\.py)", line (\d+)')
+_JAVA_FILE_LINE_RE = re.compile(r"\(([A-Za-z0-9_$]+\.java):(\d+)\)")
 
-STACK_TRACE_HINTS = [
-    re.compile(r"Traceback \(most recent call last\):"),
-    re.compile(r"Stack trace:\s*#0", re.I),
-    re.compile(r"at\s+[\w$.]+\([\w.]+:\d+\)"),
-    re.compile(r"Caused by:\s*[\w.$]+Exception"),
-]
+FILESYSTEM_PATH_PATTERNS = (
+    _WINDOWS_PATH_RE,
+    _UNIX_PATH_RE,
+    _PYTHON_TRACEBACK_FILE_RE,
+    _JAVA_FILE_LINE_RE,
+)
 
-MAX_EVIDENCE_LEN = 220
-
-
-def _clip(text: str, length: int = MAX_EVIDENCE_LEN) -> str:
-    text = re.sub(r"\s+", " ", text).strip()
-    return text if len(text) <= length else text[:length] + "..."
+_OWASP_CATEGORY = "A10:2025(Draft)-Mishandling of Exceptions"
+_CWE_ERROR_HANDLING = "https://cwe.mitre.org/data/definitions/388.html"
+_CWE_INFO_EXPOSURE_ERROR = "https://cwe.mitre.org/data/definitions/209.html"
+_CWE_INFO_EXPOSURE_DEBUG = "https://cwe.mitre.org/data/definitions/215.html"
 
 
-def _first_match(patterns, body: str):
-    for pattern in patterns:
-        m = pattern.search(body)
-        if m:
-            return m
-    return None
+class ExceptionMishandlingScanner:
+    """Passive scanner for A10: Mishandling of Exceptions."""
 
+    async def scan(self, target: Target) -> list[Finding]:
+        """
+        Analyze every Endpoint already discovered on ``target`` for
+        symptoms of exceptions being surfaced rather than safely
+        handled. Purely passive - no active checks, no HttpClient.
 
-# --------------------------------------------------------------------------- #
-# Scanner
-# --------------------------------------------------------------------------- #
+        Returns:
+            Every Finding produced across all endpoints.
+        """
+        findings: list[Finding] = []
 
-class A10ExceptionScanner:
-    """
-    Scans a target for symptoms of A10: Mishandling of Exceptions.
+        for endpoint in target.endpoints:
+            findings.extend(self._run_passive_checks(endpoint))
 
-    Black-box approach: sends a set of harmless probe requests engineered to
-    trigger edge-case/exception paths (missing params, unexpected types,
-    boundary values) and inspects responses for:
-      - NULL/None dereference hints (exception caught but message leaked raw)
-      - Sensitive data leaking out of the exception (paths, DB info, stacks)
-    """
+        return findings
 
-    MODULE_NAME = "A10-mishandling-exceptions"
+    # ------------------------------------------------------------------
+    # Passive checks
+    # ------------------------------------------------------------------
 
-    # Requests designed to be harmless but likely to hit unguarded exception
-    # paths: missing required params, wrong types, empty/None-ish values.
-    PROBES = [
-        ("/?id=", "empty id param"),
-        ("/?id=null", "literal 'null' as param value"),
-        ("/?id=undefined", "literal 'undefined' as param value"),
-        ("/?page=NaN", "non-numeric where number expected"),
-        ("/?user_id=-1", "boundary/negative id"),
-        ("/?callback=", "empty callback param"),
-        ("/api/user", "missing required path segment / no id"),
-        ("/api/user/", "trailing slash, likely missing id"),
-        ("/search?q=", "empty search query"),
-    ]
+    def _run_passive_checks(self, endpoint: Endpoint) -> list[Finding]:
+        if endpoint.response.status_code < 400:
+            return []
+        findings: list[Finding] = []
+        findings.extend(self._check_null_reference_errors(endpoint))
+        findings.extend(self._check_filesystem_path_disclosure(endpoint))
+        findings.extend(self._check_database_connection_disclosure(endpoint))
+        return findings
 
-    def __init__(
-        self,
-        base_url: str,
-        session: Optional[requests.Session] = None,
-        timeout: float = 10.0,
-        verify_tls: bool = True,
-        user_agent: str = "A10-Scanner/1.0",
-    ):
-        if requests is None:
-            raise RuntimeError("The 'requests' package is required: pip install requests")
-        self.base_url = base_url.rstrip("/")
-        self.session = session or requests.Session()
-        self.session.headers.setdefault("User-Agent", user_agent)
-        self.timeout = timeout
-        self.verify_tls = verify_tls
+    def _check_null_reference_errors(self, endpoint: Endpoint) -> list[Finding]:
+        body = endpoint.response.body
+        match = self._find_match(body, NULL_REFERENCE_PATTERNS)
+        if not match:
+            return []
 
-    # -- internal helpers --------------------------------------------------- #
+        return [Finding(
+            title="Null-Reference Exception Leaked to Response",
+            severity=Severity.MEDIUM,
+            endpoint=endpoint,
+            description=(
+                "The response body contains a null/undefined-reference "
+                "error (e.g. a NullPointerException, 'Cannot read "
+                "property of null/undefined', or an unset object "
+                "reference). This indicates an unhandled exception path "
+                "reaching the client rather than being caught and "
+                "translated into a safe, generic error, and can hint at "
+                "an underlying logic bug an attacker may be able to "
+                "trigger deliberately."
+            ),
+            remediation=[
+                "Catch null/undefined-reference exceptions at the "
+                "appropriate layer instead of letting them propagate to "
+                "the HTTP response.",
+                "Validate inputs and object state before use so these "
+                "conditions are prevented rather than merely caught.",
+                "Return a generic, non-revealing error message to the "
+                "client and log the full exception server-side only.",
+            ],
+            evidence={"pattern": match, "snippet": self._snippet(body, match)},
+            references=[_CWE_ERROR_HANDLING, _CWE_INFO_EXPOSURE_ERROR],
+            owasp=_OWASP_CATEGORY,
+            cvss_score=5.3,
+        )]
 
-    def _get(self, path: str):
-        url = urljoin(self.base_url + "/", path.lstrip("/"))
-        try:
-            return url, self.session.get(
-                url, timeout=self.timeout, verify=self.verify_tls, allow_redirects=True
-            )
-        except requests.RequestException as exc:
-            return url, exc
+    def _check_filesystem_path_disclosure(self, endpoint: Endpoint) -> list[Finding]:
+        body = endpoint.response.body
+        match = self._find_path_match(body)
+        if not match:
+            return []
 
-    def _check_null_hints(self, url: str, body: str, report: ScanReport) -> None:
-        match = _first_match(NULL_HINT_PATTERNS, body)
-        if match:
-            report.add(Finding(
-                check="null_reference_hint",
-                severity="medium",
-                url=url,
-                evidence=_clip(match.group(0)),
-                detail="Response reveals an unhandled null/None dereference error",
-            ))
+        return [Finding(
+            title="File System Path Disclosure in Error Output",
+            severity=Severity.HIGH,
+            endpoint=endpoint,
+            description=(
+                "The response body contains an absolute file system "
+                "path (or a source-file/line reference from an "
+                "unhandled exception), revealing server-side directory "
+                "layout, deployment structure, or source file "
+                "organization to the client."
+            ),
+            remediation=[
+                "Catch exceptions before their raw representation "
+                "(including file paths and line numbers) reaches the "
+                "client.",
+                "Return a generic error message with no file system "
+                "detail, and log the full exception - including paths - "
+                "server-side only.",
+            ],
+            evidence={"matched_path": match, "snippet": self._snippet(body, match)},
+            references=[_CWE_INFO_EXPOSURE_DEBUG, _CWE_INFO_EXPOSURE_ERROR],
+            owasp=_OWASP_CATEGORY,
+            cvss_score=7.1,
+        )]
 
-    def _check_sensitive_in_errors(self, url: str, body: str, report: ScanReport) -> None:
-        path_match = _first_match(FILE_PATH_PATTERNS, body)
-        if path_match:
-            report.add(Finding(
-                check="sensitive_file_path_disclosure",
-                severity="high",
-                url=url,
-                evidence=_clip(path_match.group(0)),
-                detail="Exception output discloses server file-system path",
-            ))
+    def _check_database_connection_disclosure(self, endpoint: Endpoint) -> list[Finding]:
+        body = endpoint.response.body
+        match = self._find_match(body, DB_CONNECTION_PATTERNS)
+        if not match:
+            return []
 
-        db_match = _first_match(DB_INFO_PATTERNS, body)
-        if db_match:
-            report.add(Finding(
-                check="sensitive_db_info_disclosure",
-                severity="critical",
-                url=url,
-                evidence=_clip(db_match.group(0)),
-                detail="Exception output discloses database connection/query details",
-            ))
+        return [Finding(
+            title="Database Connection Detail Disclosure in Error Output",
+            severity=Severity.HIGH,
+            endpoint=endpoint,
+            description=(
+                "The response body contains what appears to be a "
+                "database connection string or connection parameter "
+                "(driver URI, host, user, or password field), most "
+                "likely leaked via an unhandled database exception. "
+                "This can directly expose credentials or internal "
+                "network/database topology."
+            ),
+            remediation=[
+                "Catch database exceptions at the data-access layer and "
+                "never let a raw connection string or driver exception "
+                "reach the client.",
+                "Rotate any credentials that may have already been "
+                "exposed through this endpoint.",
+                "Log the full exception, including connection details, "
+                "server-side only, ideally with credential redaction.",
+            ],
+            evidence={"pattern": match, "snippet": self._snippet(body, match)},
+            references=[_CWE_INFO_EXPOSURE_ERROR, _CWE_ERROR_HANDLING],
+            owasp=_OWASP_CATEGORY,
+            cvss_score=8.2,
+        )]
 
-        stack_match = _first_match(STACK_TRACE_HINTS, body)
-        if stack_match:
-            report.add(Finding(
-                check="sensitive_stack_trace_disclosure",
-                severity="high",
-                url=url,
-                evidence=_clip(stack_match.group(0)),
-                detail="Exception was not caught generically; raw stack trace exposed",
-            ))
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
 
-    def _run_probes(self, report: ScanReport) -> None:
-        for path, _label in self.PROBES:
-            url, resp = self._get(path)
-            if isinstance(resp, Exception):
-                continue
-            body = resp.text or ""
-            self._check_null_hints(url, body, report)
-            self._check_sensitive_in_errors(url, body, report)
+    @staticmethod
+    def _find_match(text: str, patterns: list[str]) -> Optional[str]:
+        """Return the first pattern found in ``text`` (case-insensitive), or None."""
+        lowered = text.lower()
+        for pattern in patterns:
+            if pattern.lower() in lowered:
+                return pattern
+        return None
 
-    # -- public API ----------------------------------------------------------- #
+    @staticmethod
+    def _find_path_match(text: str) -> Optional[str]:
+        """Return the first file-system-path-like match found in ``text``, or None."""
+        for pattern in FILESYSTEM_PATH_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                return match.group(0)
+        return None
 
-    def scan(self) -> ScanReport:
-        report = ScanReport(module=self.MODULE_NAME, target=self.base_url)
-
-        # Baseline homepage check as well, in case errors surface there
-        url, resp = self._get("/")
-        if not isinstance(resp, Exception):
-            body = resp.text or ""
-            self._check_null_hints(url, body, report)
-            self._check_sensitive_in_errors(url, body, report)
-
-        self._run_probes(report)
-        return report
-
-
-# --------------------------------------------------------------------------- #
-# CLI entry point
-# --------------------------------------------------------------------------- #
-
-def main(argv: Optional[List[str]] = None) -> int:
-    argv = argv if argv is not None else sys.argv[1:]
-    if not argv:
-        print("Usage: python3 a10_exceptions.py <base_url>", file=sys.stderr)
-        return 1
-
-    target = argv[0]
-    scanner = A10ExceptionScanner(base_url=target)
-    report = scanner.scan()
-    print(report.to_json())
-    return 0 if not report.findings else 2
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    @staticmethod
+    def _snippet(body: str, match: str, context: int = 40) -> str:
+        """Return a short excerpt of ``body`` centered on ``match`` as evidence."""
+        idx = body.lower().find(match.lower())
+        if idx == -1:
+            return match
+        start = max(0, idx - context)
+        end = min(len(body), idx + len(match) + context)
+        return body[start:end].strip()
